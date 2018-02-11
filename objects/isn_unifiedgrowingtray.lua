@@ -4,9 +4,9 @@ require "/scripts/power.lua"
 
 timer = 0
 
-seedslot = 1
-waterslot = 2
-fertslot = 3
+seedslot = 0
+waterslot = 1
+fertslot = 2
 
 function init()
 	defaults = {
@@ -51,8 +51,8 @@ function update(dt)
 	if timer >= 1 then
 		timer = 0
 		transferUtil.loadSelfContainer()
-		-- Also update description.
-		object.setConfigParameter('description', isn_makeGrowingTrayDescription())
+		-- Check tray inputs/update description
+		checkTrayInputs()
 	end
 	timer = timer + dt
 
@@ -73,12 +73,31 @@ function update(dt)
 	updateState()
 end
 
+--Tries to remove the item from a key input slot (ie invalid item for the slot).
+local function relocateItem(slot)
+	local item = world.containerTakeAt(entity.id(), slot)
+	local overflow = fu_storeItems(item, {0, 1, 2})
+	if overflow then
+		world.containerPutItemsAt(entity.id(), overflow, slot)
+		return true
+	end
+	return false
+end
+
 -- Generates a modified description string for use on inspection.
-function isn_makeGrowingTrayDescription()
-	local fert = world.containerItems(entity.id())[fertslot]
-	fert = fert and self.fertInputs[fert.name] or nil
-	local water = world.containerItems(entity.id())[waterslot]
-	water = water and self.liquidInputs[water.name] or nil
+-- Also pops any items that aren't valid inputs into general storage (if there is room)
+function checkTrayInputs()
+	-- Gather information about the items in input slots
+	local inputWater = world.containerItemAt(entity.id(), waterslot)
+	local inputFert = world.containerItemAt(entity.id(), fertslot)
+	local water = inputWater and self.liquidInputs[inputWater.name] or nil
+	local fert = inputFert and self.fertInputs[inputFert.name] or nil
+	
+	-- Relocate invalid inputs
+	if inputWater and not water then relocateItem(waterslot) end
+	if inputFert and not fert then relocateItem(fertslot) end
+	
+	-- Generate new description
 	local desc = root.itemConfig(object.name())
 	desc = desc and desc.config and desc.config.description or ''
 	desc = desc .. (desc ~= '' and "\n" or '') .. '^green;'
@@ -87,7 +106,7 @@ function isn_makeGrowingTrayDescription()
 		.. 'Growth Rate: ' .. getFertSum('growthRate', fert, water) .. "\n"
 		.. '  Water Use: ' .. getFertSum('fluidUse', fert, water) .. "\n"
 		.. '^blue;Water Value: ' .. (water and water.value or '0')
-	return desc
+	object.setConfigParameter('description', desc)
 end
 
 --Returns active seed when tray is removed from world
@@ -156,29 +175,16 @@ function growPlant(growthmod, dt)
 			fu_sendOrStoreItems(0, item, item.name == storage.currentseed.name and seedavoid or avoid)
 		end
 
-		-- Go to reset stage for perennial plants and full reset for others
-		local seed = world.containerItems(entity.id())[seedslot]
-		if seed and seed.name ~= storage.currentseed.name and stage().resetToStage then
-			storage.currentseed.count = getFertSum("seedUse")
-			fu_sendOrStoreItems(0, storage.currentseed, avoid)
-			storage.currentStage = 1
-			storage.growth = 0
-			storage.currentseed = nil
-		elseif stage().resetToStage then
-			storage.currentStage = stage().resetToStage + 1
-			storage.growth = storage.currentStage == 1 and 0 or storage.stage[storage.currentStage - 1].val
-			resetBonuses()
-			local fertName = doFertProcess()
-			if fertName then
-				storage.fert = self.fertInputs[fertName]
-				world.containerConsume(entity.id(), {name = fertName, count = 1, data={}})
-			end
-			storage.hasFluid = doFluidConsume()
-		else
-			storage.currentStage = 1
-			storage.growth = 0
-			storage.currentseed = nil
+		-- Perennial plants should return yeild of seeds for balance purposes.
+		-- By returning yield seeds we handle part of perennials regrowing from the same seed.
+		if stage().resetToStage then
+			storage.currentseed.count = getFertSum("yield")
+			fu_sendOrStoreItems(0, storage.currentseed, seedAvoid)
+			storage.previousName = storage.currentseed.name
 		end
+
+		-- Clear the current seed growing, this introduces 1 update worth of inactivity.
+		storage.currentseed = nil
 	end
 end
 
@@ -196,7 +202,7 @@ end
 --Updates internal fluid levels, consumes required fluid units, and updates any fluid bonuses.
 --optional arg fluidNeed is amount of fluid required to top up to.
 function doWaterIntake(fluidNeed)
-	local water = world.containerItems(entity.id())[waterslot]
+	local water = world.containerItemAt(entity.id(), waterslot)
 
 	if water and self.liquidInputs[water.name] then
 		storage.water = self.liquidInputs[water.name]
@@ -220,7 +226,7 @@ end
 
 --Fetch the seed from the storage slot, also does validity check.
 function readContainerSeed()
-	local seed = world.containerItems(entity.id())[seedslot]
+	local seed = world.containerItemAt(entity.id(), seedslot)
 	if not seed then return end
 	--Verify the seed is valid for use.
 	local seedConfig = root.itemConfig(seed).config
@@ -241,20 +247,23 @@ end
 
 --Generates growth data to tell when a plant is ready for harvest and when it
 --needs to be watered.
-function genGrowthData(initStage)
-	initStage = initStage or 1
-	--Make sure some things make sense for a perennial, if not act like it's annual
-	if initStage > storage.stages then
-		initStage = 1
-		storage.resetStage = 1
-	end
-	storage.currentStage = initStage
+--Also handles some of perennial growth mechanics.
+function genGrowthData()
 	storage.growthCap = 0
 	for index,stage in ipairs(storage.stage) do
 		storage.growthCap = storage.growthCap + (stage.duration and stage.duration[1] or 0)
 		stage.val = storage.growthCap
 	end
-	return true
+	
+	-- Perennial growth handling (the other part of perennial handling)
+	if storage.previousName and	storage.currentseed.name == storage.previousName and
+			storage.stage[storage.stages].resetToStage + 1 <= storage.stages then
+		-- Add 1 to resetToStage because C (Starbound) arrays are base 0 and Lua is base 1.
+		storage.currentStage = storage.stage[storage.stages].resetToStage + 1
+		storage.growth = storage.currentStage == 1 and 0 or storage.stage[storage.currentStage - 1].val
+	else
+		storage.currentStage = 1
+	end
 end
 
 --Initialize plant activity (start from scratch)
@@ -283,18 +292,16 @@ function doSeedIntake()
 	--verify we have enough seeds to proceed.
 	if storage.currentseed.count < getFertSum("seedUse") then
 		storage.currentseed = nil
-		storage.harvestPool = nil
 		storage.fert = {}
 		return false
 	end
 
 	--Generate growth data.
-	if not genGrowthData() then
-		storage.currentseed = nil
-		storage.harvestPool = nil
-		storage.fert = {}
-		return false
-	end
+	genGrowthData()
+	
+	--Clear the old perennial data.
+	storage.previousName = nil
+	
 	--All state tests passed and we are ready to grow, consume some items.
 
 	--Consume a unit of fertilizer.
@@ -311,7 +318,7 @@ end
 --Reads the current fertilizer slot and modifies growing state data
 --Returns false if nothing to do, true if successful
 function doFertProcess()
-	local fert = world.containerItems(entity.id())[fertslot]
+	local fert = world.containerItemAt(entity.id(), fertslot)
 
 	if fert and self.fertInputs[fert.name] and fert.count > 0 then
 		storage.fert = self.fertInputs[fert.name]
